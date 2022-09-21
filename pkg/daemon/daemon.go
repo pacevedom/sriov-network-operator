@@ -10,17 +10,15 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/golang/glog"
-	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
-	daemonconsts "github.com/openshift/machine-config-operator/pkg/daemon/constants"
-	mcclientset "github.com/openshift/machine-config-operator/pkg/generated/clientset/versioned"
-	mcfginformers "github.com/openshift/machine-config-operator/pkg/generated/informers/externalversions"
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -70,8 +68,6 @@ type Daemon struct {
 	// kubeClient allows interaction with Kubernetes, including the node we are running on.
 	kubeClient kubernetes.Interface
 
-	mcClient mcclientset.Interface
-
 	nodeState *sriovnetworkv1.SriovNetworkNodeState
 
 	enabledPlugins map[string]plugin.VendorPlugin
@@ -100,7 +96,8 @@ type Daemon struct {
 
 	workqueue workqueue.RateLimitingInterface
 
-	mcpName string
+	updatingFlagMutex sync.Mutex
+	updatingFlag      bool
 }
 
 const (
@@ -109,7 +106,6 @@ const (
 	annoKey             = "sriovnetwork.openshift.io/state"
 	annoIdle            = "Idle"
 	annoDraining        = "Draining"
-	annoMcpPaused       = "Draining_MCP_Paused"
 	syncStatusSucceeded = "Succeeded"
 	syncStatusFailed    = "Failed"
 )
@@ -134,7 +130,6 @@ func New(
 	nodeName string,
 	client snclientset.Interface,
 	kubeClient kubernetes.Interface,
-	mcClient mcclientset.Interface,
 	exitCh chan<- error,
 	stopCh <-chan struct{},
 	syncCh <-chan struct{},
@@ -146,7 +141,6 @@ func New(
 		platform:   platformType,
 		client:     client,
 		kubeClient: kubeClient,
-		mcClient:   mcClient,
 		exitCh:     exitCh,
 		stopCh:     stopCh,
 		syncCh:     syncCh,
@@ -209,6 +203,9 @@ func (dn *Daemon) Run(stopCh <-chan struct{}, exitCh <-chan error) error {
 	// Only watch own SriovNetworkNodeState CR
 	defer utilruntime.HandleCrash()
 	defer dn.workqueue.ShutDown()
+
+	signalCh := make(chan struct{})
+	dn.installSignalHandler(signalCh)
 
 	tryEnableRdma()
 	tryEnableTun()
@@ -278,6 +275,9 @@ func (dn *Daemon) Run(stopCh <-chan struct{}, exitCh <-chan error) error {
 		select {
 		case <-stopCh:
 			glog.V(0).Info("Run(): stop daemon")
+			return nil
+		case <-signalCh:
+			glog.V(0).Info("Run(): signal received")
 			return nil
 		case err, more := <-exitCh:
 			glog.Warningf("Got an error: %v", err)
@@ -378,7 +378,7 @@ func (dn *Daemon) nodeUpdateHandler(old, new interface{}) {
 		return
 	}
 	for _, node := range nodes {
-		if node.GetName() != dn.name && (node.Annotations[annoKey] == annoDraining || node.Annotations[annoKey] == annoMcpPaused) {
+		if node.GetName() != dn.name && node.Annotations[annoKey] == annoDraining {
 			dn.drainable = false
 			return
 		}
@@ -487,11 +487,6 @@ func (dn *Daemon) nodeStateSyncHandler() error {
 			}
 		}
 	}
-	if utils.ClusterType == utils.ClusterTypeOpenshift {
-		if err = dn.getNodeMachinePool(); err != nil {
-			return err
-		}
-	}
 
 	if reqDrain {
 		if !dn.isNodeDraining() {
@@ -504,13 +499,8 @@ func (dn *Daemon) nodeStateSyncHandler() error {
 				go dn.getDrainLock(ctx, done)
 				<-done
 			}
-
-			if utils.ClusterType == utils.ClusterTypeOpenshift {
-				glog.Infof("nodeStateSyncHandler(): pause MCP")
-				if err := dn.pauseMCP(); err != nil {
-					return err
-				}
-			}
+			dn.enableUpdatingFlag()
+			defer dn.disableUpdatingFlag()
 		}
 
 		glog.Info("nodeStateSyncHandler(): drain node")
@@ -533,8 +523,10 @@ func (dn *Daemon) nodeStateSyncHandler() error {
 
 	if reqReboot {
 		glog.Info("nodeStateSyncHandler(): reboot node")
-		rebootNode()
-		return nil
+		if err := rebootNode(); err != nil {
+			glog.Errorf("nodeStateSyncHandler(): failed to reboot the node: %v", err)
+			return err
+		}
 	}
 
 	// restart device plugin pod
@@ -576,7 +568,7 @@ func (dn *Daemon) nodeHasAnnotation(annoKey string, value string) bool {
 }
 
 func (dn *Daemon) isNodeDraining() bool {
-	if anno, ok := dn.node.Annotations[annoKey]; ok && (anno == annoDraining || anno == annoMcpPaused) {
+	if anno, ok := dn.node.Annotations[annoKey]; ok && anno == annoDraining {
 		return true
 	}
 	return false
@@ -585,15 +577,6 @@ func (dn *Daemon) isNodeDraining() bool {
 func (dn *Daemon) completeDrain() error {
 	if !dn.disableDrain {
 		if err := drain.RunCordonOrUncordon(dn.drainer, dn.node, false); err != nil {
-			return err
-		}
-	}
-
-	if utils.ClusterType == utils.ClusterTypeOpenshift {
-		glog.Infof("completeDrain(): resume MCP %s", dn.mcpName)
-		pausePatch := []byte("{\"spec\":{\"paused\":false}}")
-		if _, err := dn.mcClient.MachineconfigurationV1().MachineConfigPools().Patch(context.Background(), dn.mcpName, types.MergePatchType, pausePatch, metav1.PatchOptions{}); err != nil {
-			glog.Errorf("completeDrain(): failed to resume MCP %s: %v", dn.mcpName, err)
 			return err
 		}
 	}
@@ -662,7 +645,7 @@ func (dn *Daemon) restartDevicePluginPod() error {
 	return nil
 }
 
-func rebootNode() {
+func rebootNode() error {
 	glog.Infof("rebootNode(): trigger node reboot")
 	exit, err := utils.Chroot("/host")
 	if err != nil {
@@ -670,18 +653,19 @@ func rebootNode() {
 	}
 	defer exit()
 	// creates a new transient systemd unit to reboot the system.
-	// We explictily try to stop kubelet.service first, before anything else; this
-	// way we ensure the rest of system stays running, because kubelet may need
-	// to do "graceful" shutdown by e.g. de-registering with a load balancer.
-	// However note we use `;` instead of `&&` so we keep rebooting even
-	// if kubelet failed to shutdown - that way the machine will still eventually reboot
-	// as systemd will time out the stop invocation.
+	// With the upstream implementation of kubelet graceful shutdown feature,
+	// we don't explicitly stop the kubelet so that kubelet can gracefully shutdown
+	// pods when `GracefulNodeShutdown` feature gate is enabled.
+	// kubelet uses systemd inhibitor locks to delay node shutdown to terminate pods.
+	// https://kubernetes.io/docs/concepts/architecture/nodes/#graceful-node-shutdown
 	cmd := exec.Command("systemd-run", "--unit", "sriov-network-config-daemon-reboot",
-		"--description", "sriov-network-config-daemon reboot node", "/bin/sh", "-c", "systemctl stop kubelet.service; reboot")
+		"--description", "sriov-network-config-daemon reboot node", "/bin/sh", "-c", "systemctl reboot")
 
 	if err := cmd.Run(); err != nil {
 		glog.Errorf("failed to reboot node: %v", err)
+		return err
 	}
+	return nil
 }
 
 func (dn *Daemon) annotateNode(node, value string) error {
@@ -724,27 +708,6 @@ func (dn *Daemon) annotateNode(node, value string) error {
 	return nil
 }
 
-func (dn *Daemon) getNodeMachinePool() error {
-	desiredConfig, ok := dn.node.Annotations[daemonconsts.DesiredMachineConfigAnnotationKey]
-	if !ok {
-		glog.Errorf("getNodeMachinePool(): Failed to find the the desiredConfig Annotation")
-		return fmt.Errorf("getNodeMachinePool(): Failed to find the the desiredConfig Annotation")
-	}
-	mc, err := dn.mcClient.MachineconfigurationV1().MachineConfigs().Get(context.TODO(), desiredConfig, metav1.GetOptions{})
-	if err != nil {
-		glog.Errorf("getNodeMachinePool(): Failed to get the desired Machine Config: %v", err)
-		return err
-	}
-	for _, owner := range mc.OwnerReferences {
-		if owner.Kind == "MachineConfigPool" {
-			dn.mcpName = owner.Name
-			return nil
-		}
-	}
-	glog.Error("getNodeMachinePool(): Failed to find the MCP of the node")
-	return fmt.Errorf("getNodeMachinePool(): Failed to find the MCP of the node")
-}
-
 func (dn *Daemon) getDrainLock(ctx context.Context, done chan bool) {
 	var err error
 
@@ -771,11 +734,6 @@ func (dn *Daemon) getDrainLock(ctx context.Context, done chan bool) {
 				glog.V(2).Info("getDrainLock(): started leading")
 				for {
 					time.Sleep(3 * time.Second)
-					if dn.node.Annotations[annoKey] == annoMcpPaused {
-						// The node in Draining_MCP_Paused state, no other node is draining. Skip drainable checking
-						done <- true
-						return
-					}
 					if dn.drainable {
 						glog.V(2).Info("getDrainLock(): no other node is draining")
 						err = dn.annotateNode(dn.name, annoDraining)
@@ -794,94 +752,6 @@ func (dn *Daemon) getDrainLock(ctx context.Context, done chan bool) {
 			},
 		},
 	})
-}
-
-func (dn *Daemon) pauseMCP() error {
-	glog.Info("pauseMCP(): pausing MCP")
-	var err error
-
-	mcpInformerFactory := mcfginformers.NewSharedInformerFactory(dn.mcClient,
-		time.Second*30,
-	)
-	mcpInformer := mcpInformerFactory.Machineconfiguration().V1().MachineConfigPools().Informer()
-
-	ctx, cancel := context.WithCancel(context.TODO())
-	defer cancel()
-	paused := dn.node.Annotations[annoKey] == annoMcpPaused
-
-	mcpEventHandler := func(obj interface{}) {
-		mcp := obj.(*mcfgv1.MachineConfigPool)
-		if mcp.GetName() != dn.mcpName {
-			return
-		}
-		// Always get the latest object
-		newMcp, err := dn.mcClient.MachineconfigurationV1().MachineConfigPools().Get(ctx, dn.mcpName, metav1.GetOptions{})
-		if err != nil {
-			glog.V(2).Infof("pauseMCP(): Failed to get MCP %s: %v", dn.mcpName, err)
-			return
-		}
-		if mcfgv1.IsMachineConfigPoolConditionFalse(newMcp.Status.Conditions, mcfgv1.MachineConfigPoolDegraded) &&
-			mcfgv1.IsMachineConfigPoolConditionTrue(newMcp.Status.Conditions, mcfgv1.MachineConfigPoolUpdated) &&
-			mcfgv1.IsMachineConfigPoolConditionFalse(newMcp.Status.Conditions, mcfgv1.MachineConfigPoolUpdating) {
-			glog.V(2).Infof("pauseMCP(): MCP %s is ready", dn.mcpName)
-			if paused {
-				glog.V(2).Info("pauseMCP(): stop MCP informer")
-				cancel()
-				return
-			}
-			if newMcp.Spec.Paused {
-				glog.V(2).Infof("pauseMCP(): MCP %s was paused by other, wait...", dn.mcpName)
-				return
-			}
-			glog.Infof("pauseMCP(): pause MCP %s", dn.mcpName)
-			pausePatch := []byte("{\"spec\":{\"paused\":true}}")
-			_, err = dn.mcClient.MachineconfigurationV1().MachineConfigPools().Patch(context.Background(), dn.mcpName, types.MergePatchType, pausePatch, metav1.PatchOptions{})
-			if err != nil {
-				glog.V(2).Infof("pauseMCP(): Failed to pause MCP %s: %v", dn.mcpName, err)
-				return
-			}
-			err = dn.annotateNode(dn.name, annoMcpPaused)
-			if err != nil {
-				glog.V(2).Infof("pauseMCP(): Failed to annotate node: %v", err)
-				return
-			}
-			paused = true
-			return
-		}
-		if paused {
-			glog.Infof("pauseMCP(): MCP is processing, resume MCP %s", dn.mcpName)
-			pausePatch := []byte("{\"spec\":{\"paused\":false}}")
-			_, err = dn.mcClient.MachineconfigurationV1().MachineConfigPools().Patch(context.Background(), dn.mcpName, types.MergePatchType, pausePatch, metav1.PatchOptions{})
-			if err != nil {
-				glog.V(2).Infof("pauseMCP(): fail to resume MCP %s: %v", dn.mcpName, err)
-				return
-			}
-			err = dn.annotateNode(dn.name, annoDraining)
-			if err != nil {
-				glog.V(2).Infof("pauseMCP(): Failed to annotate node: %v", err)
-				return
-			}
-			paused = false
-		}
-		glog.Infof("pauseMCP():MCP %s is not ready: %v, wait...", newMcp.GetName(), newMcp.Status.Conditions)
-	}
-
-	mcpInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: mcpEventHandler,
-		UpdateFunc: func(old, new interface{}) {
-			mcpEventHandler(new)
-		},
-	})
-
-	// The Draining_MCP_Paused state means the MCP work has been paused by the config daemon in previous round.
-	// Only check MCP state if the node is not in Draining_MCP_Paused state
-	if !paused {
-		mcpInformerFactory.Start(ctx.Done())
-		mcpInformerFactory.WaitForCacheSync(ctx.Done())
-		<-ctx.Done()
-	}
-
-	return err
 }
 
 func (dn *Daemon) drainNode() error {
@@ -924,6 +794,47 @@ func (dn *Daemon) drainNode() error {
 	}
 	glog.Info("drainNode(): drain complete")
 	return nil
+}
+
+func (dn *Daemon) getUpdatingFlag() bool {
+	dn.updatingFlagMutex.Lock()
+	defer dn.updatingFlagMutex.Unlock()
+	return dn.updatingFlag
+}
+
+func (dn *Daemon) enableUpdatingFlag() {
+	dn.updatingFlagMutex.Lock()
+	defer dn.updatingFlagMutex.Unlock()
+	dn.updatingFlag = true
+}
+
+func (dn *Daemon) disableUpdatingFlag() {
+	dn.updatingFlagMutex.Lock()
+	defer dn.updatingFlagMutex.Unlock()
+	dn.updatingFlag = false
+}
+
+func (dn *Daemon) installSignalHandler(signalCh chan struct{}) {
+	termChan := make(chan os.Signal, 2048)
+	signal.Notify(termChan, syscall.SIGTERM)
+
+	// Catch SIGTERM - if we're actively updating, we should avoid
+	// having the process be killed.
+	go func() {
+		for sig := range termChan {
+			//nolint:gocritic
+			switch sig {
+			case syscall.SIGTERM:
+				updateActive := dn.getUpdatingFlag()
+				if updateActive {
+					glog.Info("Got SIGTERM, but actively updating")
+				} else {
+					close(signalCh)
+					return
+				}
+			}
+		}
+	}()
 }
 
 func tryEnableTun() {
